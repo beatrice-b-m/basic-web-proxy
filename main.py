@@ -2,194 +2,145 @@ import socket
 import re
 from argparse import ArgumentParser
 
-"""
-You will implement a simple web proxy. The proxy will take requests from the browser/- client,
-parse the request, and send the request to the web server. The response gathered by the proxy will
-be sent back to the browser. For this functionality, the proxy should open a socket connection on
-startup, and listen for incoming requests. On getting a request from the browser, the proxy should
-parse the HTTP request to determine the destination server, and open a connection to it. It should
-then send the request, process the reply, and send it back to the browser. The port number for the
-proxy should be a command line argument.
-
-Your proxy only need to implement the HTTP GET request. If the browser/client is- sues other
-HTTP requests like HEAD or POST, you can simply return a Not Implemented error message. For
-simplicity you are allowed to use HTTP/1.0 between the proxy and the web server. There is no
-need to implement the complex features of HTTP/1.1. If the browser sends a 1.1 request, you just
-need to respond to the request, i.e. fetch the page corresponding to the GET request. Multi-thread
-is also not required in this assignment, the proxy only needs to handle one client at the same time.
-
-In order to verify your code, run the proxy program with specific port number then request a web
-page from your browser. Direct the requests to the proxy program using your IP address and port
-number. (e.g. http://localhost:8888/www.google.com)
-"""
-
 class WebProxy:
     def __init__(self, proxy_host, proxy_port, 
-                 buffer_size: int = 1024, debug: bool = False):
+                 buffer_size: int = 1024):
+        # set proxy params
         self.proxy_host = proxy_host
         self.proxy_port = proxy_port
         self.buffer_size = buffer_size
+
+        # init a list to store our previous hosts in
         self.past_host_list = []
-        self.debug = debug
 
     def start(self):
+        """
+        function to start the web proxy. starts the listener and waits for an
+        incoming connection.
+        """
         # bind socket to port and start listening
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind((self.proxy_host, self.proxy_port))
             s.listen()
-            print(f"listening on port {self.proxy_port}...")
 
             while True:
                 # wait for a connection
-                connection, address = s.accept()
-                print(f"client {address} connected...")
+                connection, _ = s.accept()
                 
-                # set connection to alive
-                live_connection = True
+                self._handle_client(connection)
+                
+    def _handle_client(self, connection):
+        """
+        function to take the connection socket provided by s.accept and handle
+        the client. the connection is closed after sending or receiving an empty
+        byte string.
+        """
+        # set connection to alive
+        live_connection = True
 
-                # initialize a variable to store the last target host
-                # we'll use this in cases where the client requests
-                # additional files
-                target_host = ''
+        with connection as c:
+            while live_connection:
+                # receive data from the connection
+                rq_data = c.recv(self.buffer_size)
+                # if an empty byte-string was received, end the loop
+                if not rq_data:
+                    break
+                
+                # read the request and respond to it
+                client_rsp_data_list, target_host = self._respond_to_message([rq_data])
+                self.past_host_list.append(target_host)
 
-                with connection as c:
-                    # set a long timeout
-                    # c.settimeout(10)
-                    while live_connection:
-                        # receive data from the connection
-                        try:
-                            rq_data = c.recv(self.buffer_size)
-
-                            # if an empty byte-string was received, end the loop
-                            print(rq_data)
-                            if not rq_data:
-                                print(f"client {address} disconnected...\n\n")
-                                break
-                            
-                            # read the request and respond to it
-                            client_rsp_data_list, target_host = self._respond_to_message([rq_data], target_host)
-                            self.past_host_list.append(target_host)
-                            print(f"start {target_host = }")
-                            # if the client hasn't specified a target host (other than localhost)
-                            # set the connection target host to the last targeted one
-                            # if not target_host:
-                            #     target_host = last_target_host
-
-                            # send the response to the clients request
-                            for rsp_data in client_rsp_data_list:
-                                # close connection and end loop
-                                if rsp_data == b'CLOSE':
-                                    c.close()
-                                    live_connection = False
-                                else:
-                                    # print('sending:\n', rsp_data)
-                                    c.sendall(rsp_data)
-                        
-                        # if the socket times out, break the loop
-                        except socket.timeout:
-                            live_connection = False
+                # send the response to the clients request
+                for rsp_data in client_rsp_data_list:
+                    # close connection and end loop
+                    c.sendall(rsp_data)
+                    if not rsp_data:
+                        live_connection = False
     
-    def _respond_to_message(self, raw_data_list: list, target_host: str):
-        # get the first chunk of data since it should contain
+    def _respond_to_message(self, raw_data_list: list):
+        """
+        function to parse a message from a remote server then respond to it.
+        OKs are returned (to be sent to the client), GETs are bounced until 
+        they return an OK, and ERRORs are returned (to be sent to the client).
+        """
+        # get the first chunk of data since it *should* contain
         # the header
         header_data = raw_data_list[0]
 
-        # parse the message then handle it and get its status type
-        parsed_data = HttpParser(header_data, target_host)
-        status, out_data = parsed_data.handle()
-        print(f"{status} received...")
+        # check if the past host list is populated and choose the last
+        # element as the previous host
+        if self.past_host_list:
+            previous_host = self.past_host_list[-1]
+        else:
+            previous_host = None
 
-        # if an empty string was given as the target host
-        # target the current parsed host
-        if not target_host:
-            print(f"overwrote original target host '{target_host}' with '{parsed_data.host}'")
-            target_host = parsed_data.host
+        # parse the data and get the message status, out data, and target host
+        data_parser = HttpParser(header_data, previous_host)
+        data_parser.parse()
+        status, out_data = data_parser.handle()
+        target_host = data_parser.host
 
         # if the header contains an OK, respond to the client
         # with the full list of raw byte strings
-        # if it exists, modify the 'Connection: close' string
-        # to request a persistent connection
         if status == 'OK':
-            rsp_data_list = self._modify_connection_type(raw_data_list)
-        
+            rsp_data_list = raw_data_list
+
         # otherwise if the message is a get (or redirect)
         # connect to the target host, get its response
         # and recursively call this function until we get an OK
         elif status == 'GET':
-            rsp_data_list, target_host = self._respond_to_message(
+            rsp_data_list, _ = self._respond_to_message(
                 self._connect_to(
                     rq_data=out_data, 
                     host=target_host
                 ), 
-                target_host
             )
         
-        # if we generated an error return it to the client and close the connection
+        # else if we generated an error return it to the client
         elif status == 'ERROR':
-            # add a custom CLOSE bytestring to tell our script to
-            # close the connection
-            rsp_data_list = [out_data, b'', b'CLOSE']
+            rsp_data_list = [out_data, b'']
 
         return rsp_data_list, target_host
-    
-    def _modify_connection_type(self, data_list):
-        out_data_list = []
-        replaced = False
-
-        old_str = b'Connection: close'
-        new_str = b'Connection: keep-alive'
-
-        for byte_string in data_list:
-            if not replaced and old_str in byte_string:
-                # Replace the first instance of the substring and mark as replaced
-                out_data_list.append(byte_string.replace(old_str, new_str))
-                replaced = True
-            else:
-                # Append the byte-string as is if not the target for replacement
-                out_data_list.append(byte_string)
-        
-        return out_data_list
-
 
     def _connect_to(self, rq_data, host: str, port: int = 80):
+        """
+        function to connect to a remote server on host with default port 80, 
+        then send it the given request (rq_data) and retrieve its response.
+        """
         rsp_list = []
         live_connection = True
         
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                print(f'connecting to {host}:{port}...')
-                s.connect((host, port))
-                s.sendall(rq_data)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((host, port))
+            s.sendall(rq_data)
 
-                while live_connection:
-                    rsp_data = s.recv(self.buffer_size)
-                    # print(rsp_data)
-                    rsp_list.append(rsp_data)
-                    if not rsp_data:
-                        live_connection = False
+            while live_connection:
+                rsp_data = s.recv(self.buffer_size)
+                rsp_list.append(rsp_data)
+                if not rsp_data:
+                    live_connection = False
 
-            return rsp_list
+        return rsp_list                
 
-        except Exception as e:
-            print(e)
-        #     return self._connect_to(rq_data, self.past_host_list[-1])
-                
-            
-        
 
 class HttpParser:
-    def __init__(self, data, target_host):
+    def __init__(self, data, previous_host):
         self.raw = data
         self.dict = dict()
 
-        self.target_host = target_host
+        self.previous_host = previous_host
         self.host = None
+        self.string = None
 
+    def parse(self):
         # decode raw byte string using iso-8859-1 encoding then parse it
         self.string = self.raw.decode("iso-8859-1")
         self._parse_string()
 
     def handle(self):
+        """
+        function to handle the raw http byte-string
+        """
         data_dict = self.dict.copy()
         message_type = data_dict.get('Message Type', None)
 
@@ -202,13 +153,17 @@ class HttpParser:
             return 'ERROR', b'HTTP/1.0 400 Bad Request\r\n\r\n'
     
     def _parse_string(self):
+        """
+        function to split the decoded string on line breaks,
+        then extract the header line to parse it. if it's a 200 OK
+        response we ignore the body (so we don't try to read hundreds
+        of lines of data)
+        """
         # split the decoded string along line breaks
         data_line_list = self.string.splitlines()
         
         # extract the first line of the request and parse it separately
         header_line = data_line_list.pop(0)
-
-        # parse the data
         self._parse_header(header_line)
 
         # if the message isn't a 200 OK, parse the body too
@@ -217,6 +172,11 @@ class HttpParser:
             self._parse_body(data_line_list)
 
     def _parse_header(self, header_line: str):
+        """
+        function to parse the header line of an HTTP message. parses
+        as either a request (rq) or response (rsp) type message depending
+        on the first header element.
+        """
         # split the header on whitespace
         header_chunk_list = re.split(' ', header_line, 2)
         
@@ -267,40 +227,57 @@ class HttpParser:
                     continue
         
     def _handle_rq_message(self, data_dict):
+        """
+        function to handle 'request'-type messages with a method (like GET or HEAD).
+        only GET is implemented, and other methods will return the 501 Note Implemented
+        error. Invalid GET requests for the root/favicon.ico of localhost receive a 404
+        Not Found error.
+        """
+        # get an indicator variable to show whether the host is new or the last
+        # should be reused
+        new_host = data_dict.get('Sec-Fetch-Site', None) != 'same-origin'
+
         # return a client error if there's no previous target host
         # and they haven't specified a path to the proxy (or if they try to get the favicon.ico of localhost)
         valid_path_host = ~(data_dict.get('Host', '').lower().startswith("localhost")) |\
             ((data_dict.get('Path', '') != '/') &\
              (data_dict.get('Path', '') != '/favicon.ico'))
         
-        if not self.target_host and not valid_path_host:
+        if new_host and not valid_path_host:
             return 'ERROR', b'HTTP/1.0 404 Not Found\r\n\r\n'
 
         # otherwise handle get
         elif data_dict.get('Method', None) == "GET":
-            return self._handle_get(data_dict)
+            return self._handle_get(data_dict, new_host)
         
         else:
             # raise an error indicating this isn't implemented yet
             return 'ERROR', b'HTTP/1.0 501 Not Implemented\r\n\r\n'
 
     def _handle_rsp_message(self, data_dict):
+        """
+        function to handle 'response'-type messages with a status code.
+        only 200, 301, and 404 are implemented. other response messages
+        will receive a 501 Not Implemented server error
+        """
         status_code = data_dict.get('Status Code', None)
         # if the message is an OK, return 'OK' to indicate the message
         # should be returned to the original client immediately
         if status_code == "200":
             return 'OK', None
         
+        if status_code == "404":
+            return 'OK', None
+        
         # otherwise handle redirects
         elif status_code == "301":
-            print('redirecting traffic...')
             return self._handle_redirect(data_dict)
 
         # otherwise return an error indicating this isn't implemented yet
         else:
             return 'ERROR', b'HTTP/1.0 501 Not Implemented\r\n\r\n'
 
-    def _handle_get(self, data_dict):
+    def _handle_get(self, data_dict, new_host: bool):
         """
         function to handle a get request, takes the path from the current
         request and reformats it to bounce it to its final destination
@@ -308,36 +285,31 @@ class HttpParser:
         file_path = data_dict.get('Path')
         host = data_dict.get('Host')
 
-        print(f"{file_path = }")
-        print(f"{host = }")
-        print(f"{self.target_host = }")
-
-        page_refreshed = (file_path == '/' + self.target_host)
-
-        # if the target host is defined, use it instead
-        if self.target_host and not page_refreshed:
-            host = self.target_host
-        # otherwise if it starts with localhost reformat it
-        # also address a failure case where the browser refreshes
-        # and resends the full url on the same connection
-        elif host.lower().startswith('localhost') | page_refreshed:
-            print('reformatting GET request:')
-            print(f"old path: {file_path}\nold host: {host}")
+        # if the host is new, reformat it
+        if new_host:
             file_path, host = self._reformat_path_host(file_path)
-            print(f"new path: {file_path}\nnew host: {host}")
+
+        # otherwise use the last one
+        else:
+            host = self.previous_host
 
         return 'GET', self._bounce_get_rq(file_path, host)
     
     def _handle_redirect(self, data_dict):
         """
         function to handle a redirect response, takes the path from the
-        reponse and reformats it to bounce a new get to its final destination
+        reponse and reformats it to bounce a new GET to its final destination
         """
         new_url = data_dict.get('Location')
         new_path, new_host = self._clean_redirect(new_url)
         return 'GET', self._bounce_get_rq(new_path, new_host)
     
     def _clean_redirect(self, url):
+        """
+        function to take the url from the Location field of a redirect
+        and parse it into a host and path (which can then be formatted into
+        a GET request)
+        """
         # only keep characters to the right of "://"
         # if "://" is not present keep the original url
         match = re.search(r'://(.*)', url)
@@ -352,12 +324,19 @@ class HttpParser:
         return new_path, new_host
     
     def _bounce_get_rq(self, new_path, new_host):
+        """
+        function to format a bounced GET request and update the object host
+        attribute with the hostname used
+        """
         # update the object destination host
         self.host = new_host
         return "GET {} HTTP/1.0\r\nHost: {}\r\n\r\n".format(new_path, new_host).encode()
 
     def _reformat_path_host(self, old_path):
         """
+        function to reformat the path and host based on the old path
+        provided in the client > proxy request (only used when a new
+        connection is established)
         """
         # add a slash to the end if it's missing
         if old_path[-1] != "/":
@@ -369,11 +348,12 @@ class HttpParser:
         # split the string on the split index
         new_host = old_path[1:split_index]
         new_path = old_path[split_index:]
-
         return new_path, new_host
 
 
 if __name__ == "__main__":
+    # get a parser for command line args and add the port argument
+    # default port is 7713
     parser = ArgumentParser("basic_web_proxy")
     parser.add_argument(
         "--port",
@@ -384,5 +364,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # instantiate the proxy and start it
     web_proxy = WebProxy("localhost", args.port)
     web_proxy.start()
